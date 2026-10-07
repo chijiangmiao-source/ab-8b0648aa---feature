@@ -23,7 +23,9 @@ APP_URL=http://127.0.0.1:3000 npm run verify   # 对运行中的服务做完整�
 ```
 
 `verify` 服务依次执行：轮换规则单元测试 → 构建检查 → HTTP 冒烟（创建二钥二门限设备域、
-分批补齐两名有效签名、读回已激活链头与两份证据、校验页面一致、并发竞争收敛、重启一致性），
+分批补齐两名有效签名、读回已激活链头与两份证据、校验页面一致、并发竞争收敛、重启一致性；
+并对可选 UTC 截止时刻分别验证**截止前激活、仅一份签名后过期、迟到重传稳定拒因、
+截止后首次补签固定、无截止候选兼容**，从页面与接口读回一致状态），
 完成后退出，退出码 0 表示全部通过。
 
 ## 授权链模型
@@ -48,10 +50,19 @@ APP_URL=http://127.0.0.1:3000 npm run verify   # 对运行中的服务做完整�
 - **激活**：同一候选下去重后的父成员签名数达到父门限时，候选检查点、签名证据、
   链头前进、竞争候选被取代在**同一次原子文件提交**（写临时文件 → fsync → rename →
   fsync 目录）中生效。所有变更经单写者串行队列，并发补签/重传只会收敛为一个活动检查点。
+- **UTC 截止时刻（可选维护窗口）**：创建候选时可给出显式 UTC 截止时刻 `deadline`
+  （留空则不设窗口，候选长期可补签，保持既有行为）。截止时刻以**处理签名的时刻**
+  （串行队列排空执行迁移时）裁决：只有 `now < deadline` 时达到父门限才能激活；
+  `now >= deadline` 后的**首次补签或读取**会在同一次串行迁移中把未激活候选固定为
+  **已过期（expired）**。固定之后的补签返回稳定拒因 `rotation_expired`，且链头、
+  签名证据与竞争候选均不被改写（过期候选不产生检查点，同摘要竞争候选仍是待签）。
+  页面与域详情持续显示截止时刻与剩余状态（倒计时）。
 - **拒因**（均不改变链头）：`wrong_parent_digest`（错误/过期父摘要）、
   `duplicate_signature`（重复/重传）、`invalid_signature`（篡改载荷/验签失败）、
   `not_parent_member`（非父成员）、`rotation_already_activated`（激活后的迟到补签）、
-  `rotation_superseded`（被取代候选）、`conflicting_rotation`（同标识不同载荷）。
+  `rotation_superseded`（被取代候选）、`rotation_expired`（维护窗口结束后固定/补签）、
+  `invalid_deadline`（截止时刻非法或不晚于当前时刻）、
+  `conflicting_rotation`（同标识不同载荷）。
 
 ## HTTP API
 
@@ -63,7 +74,7 @@ APP_URL=http://127.0.0.1:3000 npm run verify   # 对运行中的服务做完整�
 | GET | `/api/domains` | 设备域摘要列表 |
 | GET | `/api/domains/:id` | 域详情（检查点链 + 全部轮换候选及签名） |
 | GET | `/api/domains/:id/head` | 当前活动链头（含签名证据） |
-| POST | `/api/domains/:id/rotations` | 创建候选 `{rotationId, parentDigest, publicKeys, threshold}` |
+| POST | `/api/domains/:id/rotations` | 创建候选 `{rotationId, parentDigest, publicKeys, threshold, deadline?}`（`deadline` 为可选显式 UTC，如 `2026-10-07T10:00:00Z`，留空长期有效） |
 | GET | `/api/domains/:id/rotations/:rid/message` | 规范 UTF-8 待签消息（供离线签名） |
 | POST | `/api/domains/:id/rotations/:rid/signatures` | 分批提交签名 `{signatures:[{publicKey, signature}]}` |
 | POST | `/api/admin/restart` | 进程退出（仅 `ALLOW_ADMIN_RESTART=1` 时可用，供验收验证重启一致性） |
@@ -74,7 +85,9 @@ APP_URL=http://127.0.0.1:3000 npm run verify   # 对运行中的服务做完整�
 
 状态存于 `DATA_DIR/state.json`（compose 中挂载卷 `rotation-data`）。每次状态迁移
 原子落盘；应用重启后从磁盘恢复，活动链头、历史检查点与签名证据保持一致
-（验收中会真实重启进程并逐字节比对重启前后的域状态）。
+（验收中会真实重启进程并逐字节比对重启前后的域状态）。旧版本状态文件在加载时
+经**串行持久化迁移**升级（v1 → v2：为既有候选补齐 `deadline: null`，
+未设截止时刻的旧候选保持长期有效的补签/激活行为），迁移结果在任何业务写入前原子落盘。
 
 ## 目录结构
 

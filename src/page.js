@@ -38,12 +38,36 @@ function renderCheckpoint(cp) {
   </div>`;
 }
 
+function renderDeadline(rot) {
+  if (!rot.deadline) {
+    return `<p class="deadline muted">未设 UTC 截止时刻：候选长期有效，可随时补签直至达到父门限。</p>`;
+  }
+  const remainingMs = Date.parse(rot.deadline) - Date.now();
+  const state =
+    remainingMs > 0
+      ? `<span class="deadline-remaining" data-deadline="${esc(rot.deadline)}">剩余 ${formatRemaining(remainingMs)}</span>`
+      : '<span class="deadline-over">维护窗口已结束（将在下次补签/读取时固定为已过期）</span>';
+  return `<p class="deadline">UTC 截止时刻 <code>${esc(rot.deadline)}</code> · ${state}</p>`;
+}
+
+function formatRemaining(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const hh = String(h).padStart(2, '0');
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
 function renderPendingRotation(domain, rot) {
   const message = rotation.authorizationMessage(rot);
   return `<div class="checkpoint pending">
     <p>轮换标识 <code>${esc(rot.rotationId)}</code> · 状态 <strong class="pending">待签</strong></p>
     <p>固定父摘要 <code>${esc(rot.parentDigest)}</code> · 下一代次 <strong>${rot.generation}</strong></p>
     <p>候选摘要 <code>${esc(rot.digest)}</code> · 新门限 <strong>${rot.threshold}</strong> / ${rot.keys.length}</p>
+    ${renderDeadline(rot)}
     <details open><summary>排序后新公钥集（${rot.keys.length} 把）</summary>${keyList(rot.keys)}</details>
     <p>已收集签名 <strong>${rot.signatures.length}</strong> / 父门限 ${domain.threshold}</p>
     <details><summary>已收签名明细</summary>${evidenceList(rot.signatures)}</details>
@@ -66,10 +90,21 @@ function renderSupersededRotation(rot) {
   </div>`;
 }
 
+function renderExpiredRotation(rot) {
+  return `<div class="checkpoint expired">
+    <p>轮换标识 <code>${esc(rot.rotationId)}</code> · 状态 <strong class="expired">已过期</strong></p>
+    <p>固定父摘要 <code>${esc(rot.parentDigest)}</code> · 代次 ${rot.generation} · 候选摘要 <code>${esc(rot.digest)}</code></p>
+    <p>UTC 截止时刻 <code>${esc(rot.deadline || '')}</code> · 固定于 ${esc(rot.expiredAt || '')}</p>
+    <p>截止前已收集签名 <strong>${rot.signatures.length}</strong>（未达门限，链头未前进、未产生检查点/证据）</p>
+    <p class="muted">${esc(rot.rejectedReason || '')}</p>
+  </div>`;
+}
+
 function renderDomain(domain) {
   const rotations = Object.values(domain.rotations).sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
   const pending = rotations.filter((r) => r.status === 'pending');
   const superseded = rotations.filter((r) => r.status === 'superseded');
+  const expired = rotations.filter((r) => r.status === 'expired');
   const checkpoints = Object.values(domain.checkpoints).sort((a, b) => a.generation - b.generation);
 
   return `<article class="domain" id="domain-${esc(domain.id)}">
@@ -84,6 +119,9 @@ function renderDomain(domain) {
     <h4>待签候选（${pending.length}）</h4>
     ${pending.length ? pending.map((r) => renderPendingRotation(domain, r)).join('') : '<p class="muted">无</p>'}
 
+    <h4>已过期候选（${expired.length}）</h4>
+    ${expired.length ? expired.map(renderExpiredRotation).join('') : '<p class="muted">无</p>'}
+
     <h4>已拒候选（${superseded.length}）</h4>
     ${superseded.length ? superseded.map(renderSupersededRotation).join('') : '<p class="muted">无</p>'}
 
@@ -95,6 +133,8 @@ function renderDomain(domain) {
         <label>新公钥集（每行一把 64 位十六进制 Ed25519 公钥，2–5 把）
           <textarea name="publicKeys" rows="4" required></textarea></label>
         <label>新门限 <input name="threshold" type="number" min="1" max="5" value="2" required></label>
+        <label>UTC 截止时刻（可选，留空表示不设窗口、长期可补签；形如 2026-10-07T10:00:00Z）
+          <input name="deadline" placeholder="2026-10-07T10:00:00Z"></label>
         <button type="submit">创建轮换候选</button>
       </form>
     </details>
@@ -117,7 +157,10 @@ function renderPage(state) {
   .checkpoint { border-left: 4px solid #16a34a; background: #f0fdf4; padding: .5rem .9rem; margin: .6rem 0; }
   .checkpoint.pending { border-color: #d97706; background: #fffbeb; }
   .checkpoint.superseded { border-color: #dc2626; background: #fef2f2; }
-  .pending { color: #b45309; } .superseded { color: #b91c1c; }
+  .checkpoint.expired { border-color: #6b7280; background: #f3f4f6; }
+  .pending { color: #b45309; } .superseded { color: #b91c1c; } .expired { color: #4b5563; }
+  .deadline-remaining { color: #b45309; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .deadline-over { color: #b91c1c; font-weight: 600; }
   .keys li, .evidence li { margin: .25rem 0; }
   .message { background: #0f172a; color: #e2e8f0; padding: .75rem; border-radius: 6px; white-space: pre-wrap; }
   form label { display: block; margin: .5rem 0; }

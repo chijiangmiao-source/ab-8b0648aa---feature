@@ -42,6 +42,7 @@ async function handleForm(event) {
         parentDigest: (data.get('parentDigest') || '').toString().trim(),
         publicKeys: parseKeys((data.get('publicKeys') || '').toString()),
         threshold: Number(data.get('threshold')),
+        deadline: (data.get('deadline') || '').toString().trim() || undefined,
       });
     } else if (kind === 'signatures') {
       const rotationId = form.dataset.rotation;
@@ -76,13 +77,42 @@ async function loadHealth() {
       ...health.domains.map(
         (d) =>
           `设备域 ${d.name}（${d.id}）：链头 ${d.headDigest} · 代次 ${d.generation} · 门限 ${d.threshold}/${d.keys.length}` +
-          ` · 待签 ${d.counts.pending} · 已激活 ${d.counts.activated} · 已拒 ${d.counts.superseded}`,
+          ` · 待签 ${d.counts.pending} · 已激活 ${d.counts.activated} · 已过期 ${d.counts.expired || 0} · 已拒 ${d.counts.superseded}`,
       ),
     ];
     box.innerHTML = lines.map((l) => `<div>${l.replace(/</g, '&lt;')}</div>`).join('');
   } catch (err) {
     box.textContent = `健康检查失败：${err.message}`;
   }
+}
+
+function formatHms(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(Math.floor(total / 3600))}:${p(Math.floor((total % 3600) / 60))}:${p(total % 60)}`;
+}
+
+/** 每秒刷新待签候选的剩余时间；到点后刷新页面以触发服务端过期固定。 */
+function startCountdown() {
+  const labels = document.querySelectorAll('.deadline-remaining');
+  if (labels.length === 0) return;
+  const tick = () => {
+    let expired = false;
+    for (const el of labels) {
+      const remaining = Date.parse(el.dataset.deadline) - Date.now();
+      if (remaining > 0) {
+        el.textContent = `剩余 ${formatHms(remaining)}`;
+      } else {
+        expired = true;
+      }
+    }
+    if (expired) {
+      clearInterval(timer);
+      setTimeout(() => location.reload(), 250);
+    }
+  };
+  const timer = setInterval(tick, 1000);
+  tick();
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -98,4 +128,5 @@ document.addEventListener('DOMContentLoaded', () => {
     }),
   );
   loadHealth();
+  startCountdown();
 });

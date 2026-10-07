@@ -10,6 +10,11 @@
  *  - 父检查点密钥成员对“规范 UTF-8 授权消息”做 Ed25519 签名；
  *    去重后的签名者达到父门限时，候选在同一次持久化提交中激活，
  *    同一父摘要下的其余待签候选在同一提交中被取代（已拒）。
+ *  - 创建候选时可设置可选的 UTC 截止时刻（维护窗口）：只有在截止前
+ *    达到父门限才能激活；截止后首次补签或读取会在同一次串行迁移中
+ *    把未激活候选固定为“已过期”，此后的补签得到稳定拒因，
+ *    链头、签名证据与竞争候选均不被改写。未设置截止时刻的候选
+ *    保持长期有效的既有补签/激活行为。
  */
 
 const crypto = require('node:crypto');
@@ -23,6 +28,8 @@ const KEY_HEX_RE = /^[0-9a-f]{64}$/; // Ed25519 公钥：32 字节 → 64 位小
 const SIG_HEX_RE = /^[0-9a-f]{128}$/; // Ed25519 签名：64 字节 → 128 位小写十六进制
 const DIGEST_HEX_RE = /^[0-9a-f]{64}$/; // SHA-256 摘要
 const ROTATION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+// 可选 UTC 截止时刻：明确的 Z 后缀（或 +00:00），避免运营员误填本地时区。
+const UTC_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?Z$/;
 const MIN_KEYS = 2;
 const MAX_KEYS = 5;
 
@@ -93,6 +100,50 @@ function validateDomainName(name) {
   return name;
 }
 
+/**
+ * 校验并规范化可选的 UTC 截止时刻（仅格式与合法性）。
+ * 缺省（undefined/null/空串）表示不设截止时刻，候选长期可补签；
+ * 给出时必须是显式 UTC（Z 后缀）的合法时刻。
+ */
+function normalizeDeadline(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string' || !UTC_INSTANT_RE.test(value.trim())) {
+    throw new DomainError('invalid_deadline', '截止时刻必须是显式 UTC 的 ISO-8601 时间（如 2026-10-07T10:00:00Z）');
+  }
+  const ms = Date.parse(value.trim());
+  if (!Number.isFinite(ms)) {
+    throw new DomainError('invalid_deadline', '截止时刻不是合法的 ISO-8601 时间');
+  }
+  return new Date(ms).toISOString();
+}
+
+/** 新建候选时截止时刻必须晚于当前处理时刻（幂等重放不受此限）。 */
+function assertFutureDeadline(deadline, now) {
+  if (deadline !== null && Number.isFinite(Date.parse(now)) && Date.parse(deadline) <= Date.parse(now)) {
+    throw new DomainError('invalid_deadline', '截止时刻必须晚于当前时间');
+  }
+}
+
+/**
+ * 在处理时刻 now 裁决带截止时刻的候选是否已过期。
+ * 截止时刻本身视为窗口结束：now >= deadline 即过期（“截止前”严格早于截止）。
+ */
+function isPastDeadline(rotation, now) {
+  return rotation.deadline !== null && Date.parse(now) >= Date.parse(rotation.deadline);
+}
+
+/** 候选相对当前时刻的剩余状态（供页面与接口持续显示）。 */
+function deadlineStatus(rotation, now) {
+  if (!rotation.deadline) return null;
+  const remainingMs = Date.parse(rotation.deadline) - Date.parse(now);
+  return {
+    deadline: rotation.deadline,
+    now,
+    remainingMs,
+    windowOpen: remainingMs > 0,
+  };
+}
+
 /** 检查点的规范 UTF-8 序列化（用于计算摘要）。 */
 function canonicalCheckpointDocument(cp) {
   return [
@@ -159,6 +210,62 @@ function mustRotation(domain, rotationId) {
 }
 
 /**
+ * 把单个未激活且已过截止时刻的候选固定为 expired。
+ * 只改候选自身（status/expiredAt/rejectedReason），不动链头、
+ * 检查点、签名证据与其它（竞争）候选。
+ */
+function expireRotation(state, domain, rotation, now) {
+  const fixed = {
+    ...rotation,
+    status: 'expired',
+    expiredAt: now,
+    rejectedReason: `维护窗口已结束（UTC 截止时刻 ${rotation.deadline}），候选未在截止前达到父门限，固定为已过期`,
+  };
+  const nextDomain = { ...domain, rotations: { ...domain.rotations, [rotation.rotationId]: fixed } };
+  const rejection = new DomainError('rotation_expired', fixed.rejectedReason);
+  return {
+    state: { ...state, domains: { ...state.domains, [domain.id]: nextDomain } },
+    // result.rejected 让调用方在迁移持久化后给出稳定拒因（Store 只透出 result）。
+    result: { rejected: true, rejection },
+  };
+}
+
+/**
+ * 读取驱动的过期固定：截止后首次读取域时，把该域所有仍为 pending
+ * 且已过截止时刻的候选在同一次串行迁移中固定为 expired。
+ * 纯函数：无候选需要固定时返回原状态引用（跳过落盘）。
+ */
+function sweepExpiredRotations(state, domainId, now) {
+  const domain = state.domains[domainId];
+  if (!domain) return state;
+  let nextRotations = null;
+  for (const [rid, candidate] of Object.entries(domain.rotations)) {
+    if (candidate.status === 'pending' && isPastDeadline(candidate, now)) {
+      if (!nextRotations) nextRotations = { ...domain.rotations };
+      nextRotations[rid] = {
+        ...candidate,
+        status: 'expired',
+        expiredAt: now,
+        rejectedReason: `维护窗口已结束（UTC 截止时刻 ${candidate.deadline}），候选未在截止前达到父门限，固定为已过期`,
+      };
+    }
+  }
+  if (!nextRotations) return state;
+  const nextDomain = { ...domain, rotations: nextRotations };
+  return { ...state, domains: { ...state.domains, [domainId]: nextDomain } };
+}
+
+/** 读取驱动：对所有设备域做过期固定（供页面/列表/健康等全局读取路径）。 */
+function sweepAllExpired(state, now) {
+  let next = state;
+  for (const domainId of Object.keys(state.domains)) {
+    const swept = sweepExpiredRotations(next, domainId, now);
+    if (swept !== next) next = swept;
+  }
+  return next;
+}
+
+/**
  * 创建设备域：产生创世检查点（第 0 代，立即激活）并作为链头。
  */
 function createDomain(state, input, now) {
@@ -198,6 +305,8 @@ function createDomain(state, input, now) {
 /**
  * 创建轮换候选。父摘要必须等于当前链头（固定父摘要）；
  * 同一轮换标识重复创建且载荷一致时幂等返回，载荷不同则拒绝。
+ * 可选项 deadline（UTC 截止时刻）：缺省候选长期有效；给出后只有
+ * 截止前达到父门限才能激活，截止后首次补签或读取会将其固定为已过期。
  */
 function createRotation(state, domainId, input, now) {
   const domain = mustDomain(state, domainId);
@@ -213,17 +322,22 @@ function createRotation(state, domainId, input, now) {
     );
   }
   const { keys, threshold } = validateKeySet(input.publicKeys, input.threshold);
+  const deadline = normalizeDeadline(input.deadline);
 
   const existing = domain.rotations[rotationId];
   if (existing) {
     const samePayload =
       existing.parentDigest === parentDigest &&
       existing.threshold === threshold &&
+      (existing.deadline ?? null) === deadline &&
       existing.keys.length === keys.length &&
       existing.keys.every((k, i) => k === keys[i]);
     if (samePayload) return { state, result: { rotation: existing, created: false } };
     throw new DomainError('conflicting_rotation', `轮换标识 ${rotationId} 已存在且载荷不同，拒绝覆盖`);
   }
+
+  // 仅对真正新建的候选要求截止时刻在未来；幂等重放（同标识已存在）在上面直接返回。
+  assertFutureDeadline(deadline, now);
 
   const parentCheckpoint = domain.checkpoints[parentDigest];
   if (!parentCheckpoint) {
@@ -236,10 +350,12 @@ function createRotation(state, domainId, input, now) {
     generation: parentCheckpoint.generation + 1,
     threshold,
     keys,
+    deadline,
     digest: null,
     status: 'pending',
     createdAt: now,
     activatedAt: null,
+    expiredAt: null,
     rejectedReason: null,
     signatures: [],
   };
@@ -257,6 +373,18 @@ function createRotation(state, domainId, input, now) {
  * 每条签名独立给出“接受/拒因”；只有去重后的父密钥成员签名数
  * 达到父门限时，候选才激活。激活、签名证据落盘、竞争候选被取代
  * 全部发生在同一次状态迁移中（由 Store 保证同一次持久化提交）。
+ *
+ * 截止时刻以“处理签名的时刻”now 裁决（由串行队列排空时给出，
+ * 而非请求到达时刻）：
+ *  - 截止前（now < deadline）达到父门限 → 正常激活；
+ *  - 截止后（now >= deadline）的首次补签 → 在同一次迁移中把候选
+ *    固定为 expired，不接受本批任何签名，返回 rejection；
+ *  - 此后的补签得到稳定拒因 rotation_expired；
+ *  - 过期固定不改变链头、不产生检查点/证据，也不改写竞争候选。
+ *
+ * 正常接受/激活返回 { state, result }；截止后首次补签在固定过期的同时
+ * 返回 { state, result: { rejected: true, rejection } }，调用方在迁移
+ * 持久化后据此给出稳定拒因（Store 只透出 result）。
  */
 function submitSignatures(state, domainId, rotationId, signatures, now) {
   const domain = mustDomain(state, domainId);
@@ -267,6 +395,16 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
   if (rotation.status === 'superseded') {
     throw new DomainError('rotation_superseded', `轮换 ${rotationId} 已被取代：${rotation.rejectedReason}`);
   }
+  if (rotation.status === 'expired') {
+    throw new DomainError('rotation_expired', `轮换 ${rotationId} 已过期固定（截止时刻 ${rotation.deadline}），迟到的签名不会改变链头`);
+  }
+
+  // 截止后首次补签：先固定过期状态（本次迁移持久化），再给出稳定拒因。
+  // 本批签名一律不验收、不落盘；链头、证据与竞争候选均保持原样。
+  if (isPastDeadline(rotation, now)) {
+    return expireRotation(state, domain, rotation, now);
+  }
+
   if (!Array.isArray(signatures) || signatures.length === 0) {
     throw new DomainError('invalid_batch', '签名批次必须是非空数组');
   }
@@ -422,6 +560,10 @@ module.exports = {
   MAX_KEYS,
   sortKeys,
   validateKeySet,
+  normalizeDeadline,
+  assertFutureDeadline,
+  isPastDeadline,
+  deadlineStatus,
   canonicalCheckpointDocument,
   checkpointDigest,
   authorizationMessage,
@@ -429,5 +571,7 @@ module.exports = {
   createDomain,
   createRotation,
   submitSignatures,
+  sweepExpiredRotations,
+  sweepAllExpired,
   headView,
 };
