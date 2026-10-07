@@ -10,6 +10,10 @@
  *  - 父检查点密钥成员对“规范 UTF-8 授权消息”做 Ed25519 签名；
  *    去重后的签名者达到父门限时，候选在同一次持久化提交中激活，
  *    同一父摘要下的其余待签候选在同一提交中被取代（已拒）。
+ *  - 候选可携带可选的 UTC 截止时刻：只有在截止时刻之前（含截止时刻
+ *    当刻）达到父门限才能激活；截止后首次补签或读取会把未激活候选
+ *    在同一次串行迁移中固化为“已过期”，此后签名一律得到稳定拒因，
+ *    链头、证据与竞争候选均不再变化。未设置截止时刻的候选行为不变。
  */
 
 const crypto = require('node:crypto');
@@ -34,7 +38,22 @@ class DomainError extends Error {
     super(reason);
     this.name = 'DomainError';
     this.code = code;
+    // 当拒因产生前迁移已经固定了其它状态（如截止固化）时，
+    // 携带该状态交由 Store 在同一次串行提交中落盘，默认为 null。
+    this.persistState = null;
   }
+}
+
+/**
+ * 为拒因附加状态固化：签名被拒前若截止迁移已改变状态（本候选或
+ * 其它候选被固定为已过期），Store 会先持久化该状态，再向调用方
+ * 返回稳定拒因 —— 拒绝与固化仍落在同一次串行提交里。
+ */
+function attachFixation(err, stateBefore, fixedState) {
+  if (err instanceof DomainError && fixedState !== stateBefore && err.persistState === null) {
+    err.persistState = fixedState;
+  }
+  return err;
 }
 
 function isHexKey(value) {
@@ -91,6 +110,66 @@ function validateDomainName(name) {
     throw new DomainError('invalid_name', '设备域名称须为不超过 80 字符的纯文本');
   }
   return name;
+}
+
+/**
+ * 解析可选的 UTC 截止时刻：缺省/空串表示不设截止（返回 null）；
+ * 必须是能表示时刻的 ISO 8601 字符串，且创建时严格晚于当前时刻。
+ */
+function parseExpiresAt(value, now) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string') {
+    throw new DomainError('invalid_expires_at', '截止时刻必须是 UTC ISO 8601 字符串（如 2026-10-07T12:00:00Z）');
+  }
+  const text = value.trim();
+  const ms = Date.parse(text);
+  if (!Number.isFinite(ms)) {
+    throw new DomainError('invalid_expires_at', '截止时刻不是合法的 UTC ISO 8601 时间');
+  }
+  // 归一化为毫秒精度的 UTC 表示，保证读回与比较口径一致。
+  const normalized = new Date(ms).toISOString();
+  const nowMs = Date.parse(now);
+  if (Number.isFinite(nowMs) && ms <= nowMs) {
+    throw new DomainError('invalid_expires_at', '截止时刻必须是未来的 UTC 时刻');
+  }
+  return normalized;
+}
+
+/**
+ * 截止裁决（以处理签名/读取的时刻为准，而不是签名声称的时刻）：
+ * 截止时刻为 null（不设截止）或 now 不晚于截止时刻时仍可补签激活。
+ */
+function isPastDeadline(expiresAt, now) {
+  return expiresAt !== null && Date.parse(now) > Date.parse(expiresAt);
+}
+
+/**
+ * 串行持久化迁移：把所有已过截止时刻但仍待签的候选在同一次迁移中
+ * 固化为“已过期”。不改变链头、证据与竞争候选；没有候选到期时
+ * 返回原状态引用（由 Store 跳过落盘）。
+ */
+function sweepExpirations(state, now) {
+  let changed = false;
+  const domains = {};
+  for (const [domainId, domain] of Object.entries(state.domains)) {
+    let rotations = null;
+    for (const [rid, candidate] of Object.entries(domain.rotations)) {
+      if (candidate.status === 'pending' && isPastDeadline(candidate.expiresAt, now)) {
+        if (!rotations) rotations = { ...domain.rotations };
+        rotations[rid] = {
+          ...candidate,
+          status: 'expired',
+          rejectedReason: `候选未在截止时刻 ${candidate.expiresAt} 前达到父门限，已固定为过期`,
+          expiredAt: now,
+        };
+        changed = true;
+      }
+    }
+    if (rotations) domains[domainId] = { ...domain, rotations };
+    else domains[domainId] = domain;
+  }
+  if (!changed) return state;
+  return { ...state, domains };
 }
 
 /** 检查点的规范 UTF-8 序列化（用于计算摘要）。 */
@@ -213,6 +292,7 @@ function createRotation(state, domainId, input, now) {
     );
   }
   const { keys, threshold } = validateKeySet(input.publicKeys, input.threshold);
+  const expiresAt = parseExpiresAt(input.expiresAt, now);
 
   const existing = domain.rotations[rotationId];
   if (existing) {
@@ -220,7 +300,8 @@ function createRotation(state, domainId, input, now) {
       existing.parentDigest === parentDigest &&
       existing.threshold === threshold &&
       existing.keys.length === keys.length &&
-      existing.keys.every((k, i) => k === keys[i]);
+      existing.keys.every((k, i) => k === keys[i]) &&
+      (existing.expiresAt ?? null) === expiresAt;
     if (samePayload) return { state, result: { rotation: existing, created: false } };
     throw new DomainError('conflicting_rotation', `轮换标识 ${rotationId} 已存在且载荷不同，拒绝覆盖`);
   }
@@ -239,7 +320,9 @@ function createRotation(state, domainId, input, now) {
     digest: null,
     status: 'pending',
     createdAt: now,
+    expiresAt,
     activatedAt: null,
+    expiredAt: null,
     rejectedReason: null,
     signatures: [],
   };
@@ -255,14 +338,37 @@ function createRotation(state, domainId, input, now) {
  * 为同一轮换标识分批提交签名。
  *
  * 每条签名独立给出“接受/拒因”；只有去重后的父密钥成员签名数
- * 达到父门限时，候选才激活。激活、签名证据落盘、竞争候选被取代
- * 全部发生在同一次状态迁移中（由 Store 保证同一次持久化提交）。
+ * 达到父门限且未过截止时刻时，候选才激活。激活、签名证据落盘、
+ * 竞争候选被取代全部发生在同一次状态迁移中（由 Store 保证同一次
+ * 持久化提交）。
+ *
+ * 调用方（Store 迁移）须先以处理签名的同一时刻执行 sweepExpirations：
+ * 已过截止时刻的待签候选会先在串行迁移中固化为“已过期”，随后这里
+ * 以稳定拒因 rotation_expired 拒绝，链头、证据与竞争候选均不改写。
  */
 function submitSignatures(state, domainId, rotationId, signatures, now) {
+  // 以处理签名的时刻裁决截止：到期未激活的候选先固化为已过期。
+  const sweptState = sweepExpirations(state, now);
+  try {
+    return processSignatures(sweptState, domainId, rotationId, signatures, now);
+  } catch (err) {
+    // 无论随后因何拒因返回（终态/非法批次/未知域…），sweep 已固定的
+    // 截止结果（可能发生在其它设备域）都在这同一串行槽位中落盘。
+    throw attachFixation(err, state, sweptState);
+  }
+}
+
+function processSignatures(state, domainId, rotationId, signatures, now) {
   const domain = mustDomain(state, domainId);
   const rotation = mustRotation(domain, rotationId);
   if (rotation.status === 'activated') {
     throw new DomainError('rotation_already_activated', `轮换 ${rotationId} 已激活，迟到的签名不会改变链头`);
+  }
+  if (rotation.status === 'expired') {
+    throw new DomainError(
+      'rotation_expired',
+      `轮换 ${rotationId} 已过截止时刻 ${rotation.expiresAt} 且未达到父门限，固定为过期：${rotation.rejectedReason}`,
+    );
   }
   if (rotation.status === 'superseded') {
     throw new DomainError('rotation_superseded', `轮换 ${rotationId} 已被取代：${rotation.rejectedReason}`);
@@ -344,7 +450,7 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
   let nextDomain = { ...domain, rotations: { ...domain.rotations, [rotationId]: nextRotation } };
   let activated = false;
 
-  if (mergedSignatures.length >= parentCheckpoint.threshold) {
+  if (mergedSignatures.length >= parentCheckpoint.threshold && !isPastDeadline(rotation.expiresAt, now)) {
     activated = true;
     const checkpoint = {
       digest: rotation.digest,
@@ -395,8 +501,7 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
   };
 }
 
-/** 当前活动链头视图（含签名证据）。 */
-function headView(domain) {
+/** 当前活动链头视图（含签名证据）。 */function headView(domain) {
   const head = domain.checkpoints[domain.headDigest];
   return {
     domainId: domain.id,
@@ -429,5 +534,8 @@ module.exports = {
   createDomain,
   createRotation,
   submitSignatures,
+  sweepExpirations,
+  parseExpiresAt,
+  isPastDeadline,
   headView,
 };

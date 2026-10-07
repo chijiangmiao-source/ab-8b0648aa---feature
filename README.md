@@ -23,8 +23,9 @@ APP_URL=http://127.0.0.1:3000 npm run verify   # 对运行中的服务做完整�
 ```
 
 `verify` 服务依次执行：轮换规则单元测试 → 构建检查 → HTTP 冒烟（创建二钥二门限设备域、
-分批补齐两名有效签名、读回已激活链头与两份证据、校验页面一致、并发竞争收敛、重启一致性），
-完成后退出，退出码 0 表示全部通过。
+分批补齐两名有效签名、读回已激活链头与两份证据、校验页面一致、并发竞争收敛、可选截止
+时刻四场景——截止前激活 / 仅一份签名后过期 / 迟到重传稳定拒因 / 无截止候选兼容、
+重启一致性），完成后退出，退出码 0 表示全部通过。
 
 ## 授权链模型
 
@@ -48,22 +49,36 @@ APP_URL=http://127.0.0.1:3000 npm run verify   # 对运行中的服务做完整�
 - **激活**：同一候选下去重后的父成员签名数达到父门限时，候选检查点、签名证据、
   链头前进、竞争候选被取代在**同一次原子文件提交**（写临时文件 → fsync → rename →
   fsync 目录）中生效。所有变更经单写者串行队列，并发补签/重传只会收敛为一个活动检查点。
+- **UTC 截止时刻（可选）**：创建候选时可给出 `expiresAt`（UTC ISO 8601，须为未来
+  时刻）。只有在**截止时刻之前（含当刻）**达到父门限才能激活。截止时刻**不进入**
+  规范消息与候选摘要（它是运营策略，不影响签名载荷）。截止时刻之后的**首次补签或
+  读取**会在同一次串行持久化迁移中把未激活候选固定为**已过期（expired）**：记录
+  `expiredAt` 与拒因，之后任何签名都返回稳定拒因 `rotation_expired`，链头、签名
+  证据与竞争候选均不被改写。未设置截止时刻的候选 `expiresAt` 为 `null`，补签与
+  激活行为与旧版完全一致。
+- **裁决时点与并发**：截止与否以**服务端处理签名/读取的时刻**为准（不信任客户端
+  声称的时刻）。补签与读取共用同一条单写者串行队列，因此并发的末秒达标补签与过期
+  补签只会得到一个结论——要么激活（其后补签得到 `rotation_already_activated`），
+  要么固定为过期（链头不前进）。已激活 / 待签 / 已过期状态都落盘，重启后可直接从
+  历史区分。
 - **拒因**（均不改变链头）：`wrong_parent_digest`（错误/过期父摘要）、
   `duplicate_signature`（重复/重传）、`invalid_signature`（篡改载荷/验签失败）、
-  `not_parent_member`（非父成员）、`rotation_already_activated`（激活后的迟到补签）、
+  `not_parent_member`（非父成员）、`invalid_expires_at`（截止时刻非法或不在未来）、
+  `rotation_already_activated`（激活后的迟到补签）、
+  `rotation_expired`（已过截止时刻未达门限，已固定为过期）、
   `rotation_superseded`（被取代候选）、`conflicting_rotation`（同标识不同载荷）。
 
 ## HTTP API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 运营页面（链头、待签/已拒/已激活检查点、证据、操作表单） |
+| GET | `/` | 运营页面（链头、待签/已过期/已拒/已激活检查点、证据、截止剩余倒计时、操作表单） |
 | GET | `/healthz` | 健康响应，反映各设备域链头/代次/门限状态 |
 | POST | `/api/domains` | 创建设备域 `{name?, publicKeys[2..5], threshold}` |
 | GET | `/api/domains` | 设备域摘要列表 |
 | GET | `/api/domains/:id` | 域详情（检查点链 + 全部轮换候选及签名） |
 | GET | `/api/domains/:id/head` | 当前活动链头（含签名证据） |
-| POST | `/api/domains/:id/rotations` | 创建候选 `{rotationId, parentDigest, publicKeys, threshold}` |
+| POST | `/api/domains/:id/rotations` | 创建候选 `{rotationId, parentDigest, publicKeys, threshold, expiresAt?}`（`expiresAt` 为可选未来 UTC 时刻） |
 | GET | `/api/domains/:id/rotations/:rid/message` | 规范 UTF-8 待签消息（供离线签名） |
 | POST | `/api/domains/:id/rotations/:rid/signatures` | 分批提交签名 `{signatures:[{publicKey, signature}]}` |
 | POST | `/api/admin/restart` | 进程退出（仅 `ALLOW_ADMIN_RESTART=1` 时可用，供验收验证重启一致性） |

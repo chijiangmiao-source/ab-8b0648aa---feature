@@ -297,3 +297,279 @@ test('持久化：竞争候选并发达标，磁盘上只有一个活动检查�
   assert.equal(finalDomain.headDigest, activated[0].digest);
   assert.equal(Object.values(finalDomain.checkpoints).filter((c) => c.generation === 1).length, 1, '同代次只有一个活动检查点');
 });
+
+function makeDeadlineDomain(state, members, threshold = 2) {
+  const created = makeDomain(state, members, threshold);
+  const next = [genKey(), genKey()];
+  const nextKeys = next.map((k) => k.publicKey);
+  return { ...created, nextKeys, makeRot: (s, rid, expiresAt, keys = nextKeys) =>
+    rotation.createRotation(s, created.domain.id, { rotationId: rid, parentDigest: created.domain.headDigest, publicKeys: keys, threshold: 2, ...(expiresAt === undefined ? {} : { expiresAt }) }, NOW) };
+}
+
+test('截止时刻：创建时校验（缺省/空串不设截止；非法与过去时刻被拒）', () => {
+  const members = [genKey(), genKey()];
+  const { state, domain, makeRot } = makeDeadlineDomain(freshState(), members);
+  const keys = [genKey(), genKey()].map((k) => k.publicKey);
+
+  const none = makeRot(state, 'no-deadline', undefined);
+  assert.equal(none.result.rotation.expiresAt, null);
+  assert.equal(none.result.rotation.expiredAt, null);
+
+  const empty = makeRot(state, 'empty-deadline', '');
+  assert.equal(empty.result.rotation.expiresAt, null);
+
+  const future = makeRot(state, 'future-deadline', '2026-10-06T01:00:00Z');
+  assert.equal(future.result.rotation.expiresAt, '2026-10-06T01:00:00.000Z');
+  // 截止时刻不进入候选摘要/规范文档（它是运营策略，不是签名载荷）
+  const rotWithDeadline = future.result.rotation;
+  assert.equal(
+    rotation.checkpointDigest(rotWithDeadline),
+    rotation.checkpointDigest({ ...rotWithDeadline, expiresAt: null }),
+  );
+
+  assert.throws(() => makeRot(state, 'bad', 'not-a-time'), (e) => e.code === 'invalid_expires_at');
+  assert.throws(() => makeRot(state, 'bad2', 12345), (e) => e.code === 'invalid_expires_at');
+  assert.throws(() => makeRot(state, 'past', '2026-10-05T23:59:59Z'), (e) => e.code === 'invalid_expires_at');
+  assert.throws(() => makeRot(state, 'equal', NOW), (e) => e.code === 'invalid_expires_at');
+});
+
+test('截止时刻：截止当刻达到门限仍可激活；之后固定为已过期', () => {
+  const members = [genKey(), genKey()];
+  const { state, domain, makeRot } = makeDeadlineDomain(freshState(), members);
+  const deadline = '2026-10-06T01:00:00Z';
+  const created = makeRot(state, 'edge', deadline);
+  const rot = created.result.rotation;
+  const msg = rotation.authorizationMessage(rot);
+  const s1 = rotation.submitSignatures(
+    created.state, domain.id, 'edge',
+    [{ publicKey: members[0].publicKey, signature: sign(members[0].privateKey, msg) }],
+    '2026-10-06T00:30:00.000Z',
+  ).state;
+
+  // 截止当刻 exactly == expiresAt：允许激活（“截止前”含当刻）
+  const atDeadline = rotation.submitSignatures(
+    s1, domain.id, 'edge',
+    [{ publicKey: members[1].publicKey, signature: sign(members[1].privateKey, msg) }],
+    deadline,
+  );
+  assert.equal(atDeadline.result.activated, true);
+  assert.equal(atDeadline.state.domains[domain.id].headDigest, rot.digest);
+});
+
+test('截止时刻：仅一份签名后过期 —— 首次补签/读取固化，链头证据竞争候选均不变', () => {
+  const members = [genKey(), genKey()];
+  const { state, domain, makeRot } = makeDeadlineDomain(freshState(), members);
+  const deadline = '2026-10-06T01:00:00Z';
+  const created = makeRot(state, 'expire-me', deadline);
+  const rot = created.result.rotation;
+  const msg = rotation.authorizationMessage(rot);
+  // 截止前只收集到 1/2 签名
+  const s1 = rotation.submitSignatures(
+    created.state, domain.id, 'expire-me',
+    [{ publicKey: members[0].publicKey, signature: sign(members[0].privateKey, msg) }],
+    '2026-10-06T00:30:00.000Z',
+  ).state;
+  const headBefore = s1.domains[domain.id].headDigest;
+  const checkpointCountBefore = Object.keys(s1.domains[domain.id].checkpoints).length;
+
+  // 截止后首次“读取”（sweep）即固化
+  const swept = rotation.sweepExpirations(s1, '2026-10-06T01:00:01.000Z');
+  assert.notEqual(swept, s1);
+  const expiredRot = swept.domains[domain.id].rotations['expire-me'];
+  assert.equal(expiredRot.status, 'expired');
+  assert.equal(expiredRot.expiredAt, '2026-10-06T01:00:01.000Z');
+  assert.match(expiredRot.rejectedReason, /截止时刻/);
+  assert.equal(swept.domains[domain.id].headDigest, headBefore, '固化过期不得推进链头');
+  assert.equal(Object.keys(swept.domains[domain.id].checkpoints).length, checkpointCountBefore, '不得新增检查点/证据');
+
+  // 固化后再 sweep 是幂等的（返回同一引用，不落盘）
+  assert.equal(rotation.sweepExpirations(swept, '2026-10-06T02:00:00.000Z'), swept);
+
+  // 之后的签名返回稳定拒因
+  for (let i = 0; i < 2; i++) {
+    assert.throws(
+      () => rotation.submitSignatures(swept, domain.id, 'expire-me',
+        [{ publicKey: members[1].publicKey, signature: sign(members[1].privateKey, msg) }],
+        '2026-10-06T02:00:00.000Z'),
+      (e) => e.code === 'rotation_expired',
+    );
+  }
+  // 链头与证据仍不被改写
+  const finalDomain = swept.domains[domain.id];
+  assert.equal(finalDomain.headDigest, headBefore);
+  assert.equal(finalDomain.rotations['expire-me'].signatures.length, 1, '迟到签名不得计入');
+  assert.equal(Object.keys(finalDomain.checkpoints).length, checkpointCountBefore);
+});
+
+test('截止时刻：截止后首次补签即在同一串行提交中固化并返回稳定拒因', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-deadline-sign-'));
+  const store = new Store(path.join(dir, 'state.json'));
+  store.load();
+  const members = [genKey(), genKey()];
+  const domain = await store.commit((s) => rotation.createDomain(s, { name: '截止域', publicKeys: members.map((m) => m.publicKey), threshold: 2 }, NOW));
+  const next = [genKey(), genKey()];
+  const deadline = '2026-10-06T01:00:00Z';
+  await store.commit((s) => rotation.createRotation(s, domain.id, { rotationId: 'r-exp', parentDigest: domain.headDigest, publicKeys: next.map((k) => k.publicKey), threshold: 2, expiresAt: deadline }, NOW));
+  const rot = store.state.domains[domain.id].rotations['r-exp'];
+  const msg = rotation.authorizationMessage(rot);
+  const sig0 = sign(members[0].privateKey, msg);
+  const sig1 = sign(members[1].privateKey, msg);
+
+  // 截止前一票
+  await store.commit((s) => rotation.submitSignatures(s, domain.id, 'r-exp', [{ publicKey: members[0].publicKey, signature: sig0 }], '2026-10-06T00:30:00.000Z'));
+  const headBefore = store.state.domains[domain.id].headDigest;
+
+  // 截止后首次补签：拒因 rotation_expired，且固化已落盘
+  await assert.rejects(
+    store.commit((s) => rotation.submitSignatures(s, domain.id, 'r-exp', [{ publicKey: members[1].publicKey, signature: sig1 }], '2026-10-06T01:00:01.000Z')),
+    (e) => e.code === 'rotation_expired',
+  );
+  let onDisk = JSON.parse(fs.readFileSync(store.file, 'utf8'));
+  assert.equal(onDisk.domains[domain.id].rotations['r-exp'].status, 'expired', '拒签的同时固化必须已落盘');
+  assert.equal(onDisk.domains[domain.id].headDigest, headBefore);
+
+  // 重启后仍能区分已激活/待签/已过期
+  const reloaded = new Store(store.file);
+  reloaded.load();
+  const r = reloaded.state.domains[domain.id].rotations['r-exp'];
+  assert.equal(r.status, 'expired');
+  assert.equal(r.expiresAt, '2026-10-06T01:00:00.000Z');
+  assert.equal(r.signatures.length, 1);
+  assert.equal(reloaded.state.domains[domain.id].headDigest, headBefore);
+});
+
+test('截止时刻：对其它域的拒签请求也会在同一提交固化到期候选（跨域固化）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-cross-'));
+  const store = new Store(path.join(dir, 'state.json'));
+  store.load();
+  const membersA = [genKey(), genKey()];
+  const membersB = [genKey(), genKey()];
+  const domA = await store.commit((s) => rotation.createDomain(s, { name: '域A', publicKeys: membersA.map((m) => m.publicKey), threshold: 2 }, NOW));
+  const domB = await store.commit((s) => rotation.createDomain(s, { name: '域B', publicKeys: membersB.map((m) => m.publicKey), threshold: 2 }, NOW));
+  const deadline = '2026-10-06T01:00:00Z';
+  await store.commit((s) => rotation.createRotation(s, domA.id, { rotationId: 'a-exp', parentDigest: domA.headDigest, publicKeys: [genKey(), genKey()].map((k) => k.publicKey), threshold: 2, expiresAt: deadline }, NOW));
+  await store.commit((s) => rotation.createRotation(s, domB.id, { rotationId: 'b-pending', parentDigest: domB.headDigest, publicKeys: [genKey(), genKey()].map((k) => k.publicKey), threshold: 2 }, NOW));
+
+  // 对域 B 发一个非法批次（空数组 → invalid_batch），此刻域 A 的候选恰好已到截止时刻。
+  // sweep 固化发生在拒因之前：即使请求被拒，域 A 的到期固化也必须在同一串行提交落盘。
+  await assert.rejects(
+    store.commit((s) => rotation.submitSignatures(s, domB.id, 'b-pending', [], '2026-10-06T01:00:01.000Z')),
+    (e) => e.code === 'invalid_batch',
+  );
+  // 内存与磁盘都应已固化域 A 的候选
+  assert.equal(store.state.domains[domA.id].rotations['a-exp'].status, 'expired');
+  const onDisk = JSON.parse(fs.readFileSync(store.file, 'utf8'));
+  assert.equal(onDisk.domains[domA.id].rotations['a-exp'].status, 'expired', '拒签不得吞掉其它域的截止固化');
+});
+
+test('截止时刻：并发的末秒达标补签与过期补签只收敛为一个结论（两种入队顺序各一次）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-last-second-'));
+  const store = new Store(path.join(dir, 'state.json'));
+  store.load();
+  const members = [genKey(), genKey()];
+  const deadline = '2026-10-06T01:00:00Z';
+
+  async function setupDomain(name) {
+    const domain = await store.commit((s) => rotation.createDomain(s, { name, publicKeys: members.map((m) => m.publicKey), threshold: 2 }, NOW));
+    const next = [genKey(), genKey()];
+    await store.commit((s) => rotation.createRotation(s, domain.id, { rotationId: 'r-last', parentDigest: domain.headDigest, publicKeys: next.map((k) => k.publicKey), threshold: 2, expiresAt: deadline }, NOW));
+    const rot = store.state.domains[domain.id].rotations['r-last'];
+    const msg = rotation.authorizationMessage(rot);
+    const sig0 = sign(members[0].privateKey, msg);
+    const sig1 = sign(members[1].privateKey, msg);
+    await store.commit((s) => rotation.submitSignatures(s, domain.id, 'r-last', [{ publicKey: members[0].publicKey, signature: sig0 }], '2026-10-06T00:59:59.000Z'));
+    return { domain, rot, sig1 };
+  }
+
+  const onTime = (d, sig) => store.commit((s) => rotation.submitSignatures(s, d.id, 'r-last', [{ publicKey: members[1].publicKey, signature: sig }], deadline));
+  const afterDeadline = (d, sig) => store.commit((s) => rotation.submitSignatures(s, d.id, 'r-last', [{ publicKey: members[1].publicKey, signature: sig }], '2026-10-06T01:00:01.000Z'));
+
+  // 顺序一：末秒达标补签先入队 → 激活；过期补签得到 rotation_already_activated
+  {
+    const { domain, rot, sig1 } = await setupDomain('末秒域-达标先到');
+    const outcomes = await Promise.allSettled([onTime(domain, sig1), afterDeadline(domain, sig1)]);
+    const statuses = outcomes.map((o) => (o.status === 'fulfilled' ? `activated:${o.value.activated}` : `rejected:${o.reason.code}`));
+    assert.deepEqual(statuses, ['activated:true', 'rejected:rotation_already_activated'], `达标先到的收敛不符：${statuses}`);
+    const d = store.state.domains[domain.id];
+    assert.equal(d.rotations['r-last'].status, 'activated');
+    assert.equal(d.headDigest, rot.digest);
+    assert.equal(d.checkpoints[rot.digest].evidence.length, 2);
+  }
+
+  // 顺序二：过期补签先入队 → 固化过期并拒；末秒补签得到 rotation_expired，链头不前进
+  {
+    const { domain, rot, sig1 } = await setupDomain('末秒域-过期先到');
+    const headBefore = store.state.domains[domain.id].headDigest;
+    const outcomes = await Promise.allSettled([afterDeadline(domain, sig1), onTime(domain, sig1)]);
+    const statuses = outcomes.map((o) => (o.status === 'fulfilled' ? `activated:${o.value.activated}` : `rejected:${o.reason.code}`));
+    assert.deepEqual(statuses, ['rejected:rotation_expired', 'rejected:rotation_expired'], `过期先到的收敛不符：${statuses}`);
+    const d = store.state.domains[domain.id];
+    assert.equal(d.rotations['r-last'].status, 'expired');
+    assert.equal(d.headDigest, headBefore);
+    assert.notEqual(d.headDigest, rot.digest);
+    assert.equal(d.rotations['r-last'].signatures.length, 1);
+    assert.equal(d.rotations['r-last'].expiredAt, '2026-10-06T01:00:01.000Z');
+  }
+});
+
+test('截止时刻：无截止候选保持既有补签与激活行为（兼容）', () => {
+  const members = [genKey(), genKey()];
+  const { state, domain, makeRot } = makeDeadlineDomain(freshState(), members);
+  const created = makeRot(state, 'classic');
+  assert.equal(created.result.rotation.expiresAt, null);
+  const rot = created.result.rotation;
+  const msg = rotation.authorizationMessage(rot);
+
+  // 远在“任意时刻”之后仍可补签激活
+  const s1 = rotation.submitSignatures(created.state, domain.id, 'classic',
+    [{ publicKey: members[0].publicKey, signature: sign(members[0].privateKey, msg) }],
+    '2099-01-01T00:00:00.000Z').state;
+  const done = rotation.submitSignatures(s1, domain.id, 'classic',
+    [{ publicKey: members[1].publicKey, signature: sign(members[1].privateKey, msg) }],
+    '2099-01-01T00:00:01.000Z');
+  assert.equal(done.result.activated, true);
+  assert.equal(done.state.domains[domain.id].headDigest, rot.digest);
+  // sweep 永不过期无截止候选
+  assert.equal(rotation.sweepExpirations(done.state, '2099-01-01T00:00:02.000Z'), done.state);
+});
+
+test('截止时刻：到期固化不动竞争候选；竞争候选达标激活后过期候选保持过期', () => {
+  const members = [genKey(), genKey()];
+  const { state, domain } = makeDeadlineDomain(freshState(), members);
+  const keysA = [genKey(), genKey()].map((k) => k.publicKey);
+  const keysB = [genKey(), genKey()].map((k) => k.publicKey);
+  const sA = rotation.createRotation(state, domain.id, { rotationId: 'with-deadline', parentDigest: domain.headDigest, publicKeys: keysA, threshold: 2, expiresAt: '2026-10-06T01:00:00Z' }, NOW).state;
+  const sB = rotation.createRotation(sA, domain.id, { rotationId: 'competitor', parentDigest: domain.headDigest, publicKeys: keysB, threshold: 2 }, NOW).state;
+
+  // A 到期固化为过期：竞争候选 B 必须原样保持待签，不被改写
+  const swept = rotation.sweepExpirations(sB, '2026-10-06T01:00:30.000Z');
+  assert.equal(swept.domains[domain.id].rotations['with-deadline'].status, 'expired');
+  assert.equal(swept.domains[domain.id].rotations['competitor'].status, 'pending', '固化过期不得取代竞争候选');
+
+  // B 仍可正常达标激活；A 保持过期、链头只到 B
+  const s1 = rotation.submitSignatures(swept, domain.id, 'competitor',
+    members.map((m) => ({ publicKey: m.publicKey, signature: sign(m.privateKey, rotation.authorizationMessage(swept.domains[domain.id].rotations.competitor)) })),
+    '2026-10-06T02:00:00.000Z');
+  assert.equal(s1.result.activated, true);
+  const d = s1.state.domains[domain.id];
+  assert.equal(d.rotations['with-deadline'].status, 'expired');
+  assert.equal(d.rotations['competitor'].status, 'activated');
+  assert.equal(d.headDigest, d.rotations['competitor'].digest);
+});
+
+test('截止时刻：带截止与不带截止的同标识候选被视为载荷冲突', () => {
+  const members = [genKey(), genKey()];
+  const { state, domain, nextKeys, makeRot } = makeDeadlineDomain(freshState(), members);
+  const created = makeRot(state, 'dup', '2026-10-06T01:00:00Z');
+  assert.equal(created.result.created, true);
+  // 同标识、同密钥/门限但不带截止时刻 → 载荷不同，冲突拒绝
+  assert.throws(
+    () => rotation.createRotation(created.state, domain.id,
+      { rotationId: 'dup', parentDigest: domain.headDigest, publicKeys: nextKeys, threshold: 2 }, NOW),
+    (e) => e.code === 'conflicting_rotation',
+  );
+  // 相同截止时刻则幂等
+  const again = makeRot(created.state, 'dup', '2026-10-06T01:00:00Z');
+  assert.equal(again.result.created, false);
+  assert.equal(again.state, created.state);
+});

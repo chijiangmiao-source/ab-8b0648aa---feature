@@ -16,6 +16,7 @@ const ERROR_STATUS = {
   conflicting_rotation: 409,
   rotation_already_activated: 409,
   rotation_superseded: 409,
+  rotation_expired: 409,
   invalid_json: 400,
   invalid_batch: 400,
 };
@@ -62,7 +63,22 @@ async function readJson(req) {
   }
 }
 
-function rotationView(rot) {
+/**
+ * 截止时刻的剩余状态视图（仅用于展示，权威裁决仍以服务端处理时刻
+ * 与串行迁移为准）。不设截止的候选 deadline 为 null。
+ */
+function deadlineView(rot, now) {
+  if (!rot.expiresAt) return null;
+  const remainingMs = Date.parse(rot.expiresAt) - Date.parse(now);
+  return {
+    expiresAt: rot.expiresAt,
+    remainingMillis: rot.status === 'pending' ? Math.max(0, remainingMs) : 0,
+    remainingSeconds: rot.status === 'pending' ? Math.max(0, Math.round(remainingMs / 1000)) : 0,
+    expired: rot.status === 'expired',
+  };
+}
+
+function rotationView(rot, now) {
   return {
     rotationId: rot.rotationId,
     domainId: rot.domainId,
@@ -73,6 +89,9 @@ function rotationView(rot) {
     digest: rot.digest,
     status: rot.status,
     createdAt: rot.createdAt,
+    expiresAt: rot.expiresAt,
+    expiredAt: rot.expiredAt ?? null,
+    deadline: deadlineView(rot, now),
     activatedAt: rot.activatedAt,
     rejectedReason: rot.rejectedReason || null,
     signers: rot.signatures.length,
@@ -81,7 +100,7 @@ function rotationView(rot) {
   };
 }
 
-function domainSummary(domain) {
+function domainSummary(domain, now) {
   const rotations = Object.values(domain.rotations);
   return {
     id: domain.id,
@@ -95,17 +114,18 @@ function domainSummary(domain) {
       pending: rotations.filter((r) => r.status === 'pending').length,
       activated: rotations.filter((r) => r.status === 'activated').length,
       superseded: rotations.filter((r) => r.status === 'superseded').length,
+      expired: rotations.filter((r) => r.status === 'expired').length,
     },
   };
 }
 
-function domainDetail(domain) {
+function domainDetail(domain, now) {
   return {
-    ...domainSummary(domain),
+    ...domainSummary(domain, now),
     checkpoints: Object.values(domain.checkpoints).sort((a, b) => a.generation - b.generation),
     rotations: Object.values(domain.rotations)
       .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0))
-      .map(rotationView),
+      .map((r) => rotationView(r, now)),
   };
 }
 
@@ -131,9 +151,12 @@ function createServer({ store, allowAdminRestart = false }) {
     const url = new URL(req.url, 'http://localhost');
     const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
     const method = req.method;
+    const nowIso = () => new Date().toISOString();
 
     if (method === 'GET' && segments.length === 0) {
-      const body = renderPage(store.state);
+      const now = nowIso();
+      await store.settle(now);
+      const body = renderPage(store.state, now);
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       res.end(body);
       return;
@@ -144,36 +167,45 @@ function createServer({ store, allowAdminRestart = false }) {
       return;
     }
     if (method === 'GET' && segments.length === 1 && segments[0] === 'healthz') {
+      const now = nowIso();
+      await store.settle(now);
       sendJson(res, 200, {
         status: 'ok',
         bootId,
         startedAt,
+        serverTime: now,
         uptimeSeconds: Math.round(process.uptime() * 1000) / 1000,
         persistence: 'ok',
-        domains: Object.values(store.state.domains).map(domainSummary),
+        domains: Object.values(store.state.domains).map((d) => domainSummary(d, now)),
       });
       return;
     }
 
     if (segments[0] === 'api' && segments[1] === 'domains') {
       if (method === 'GET' && segments.length === 2) {
-        sendJson(res, 200, { domains: Object.values(store.state.domains).map(domainSummary) });
+        const now = nowIso();
+        await store.settle(now);
+        sendJson(res, 200, { domains: Object.values(store.state.domains).map((d) => domainSummary(d, now)) });
         return;
       }
       if (method === 'POST' && segments.length === 2) {
         const input = await readJson(req);
         const result = await store.commit((state) => rotation.createDomain(state, input, new Date().toISOString()));
-        sendJson(res, 201, domainDetail(result));
+        sendJson(res, 201, domainDetail(result, new Date().toISOString()));
         return;
       }
       const domainId = segments[2];
       if (method === 'GET' && segments.length === 3) {
+        const now = nowIso();
+        await store.settle(now);
         const domain = store.state.domains[domainId];
         if (!domain) throw new rotation.DomainError('unknown_domain', `设备域不存在：${domainId}`);
-        sendJson(res, 200, domainDetail(domain));
+        sendJson(res, 200, domainDetail(domain, now));
         return;
       }
       if (method === 'GET' && segments.length === 4 && segments[3] === 'head') {
+        const now = nowIso();
+        await store.settle(now);
         const domain = store.state.domains[domainId];
         if (!domain) throw new rotation.DomainError('unknown_domain', `设备域不存在：${domainId}`);
         sendJson(res, 200, rotation.headView(domain));
@@ -181,13 +213,16 @@ function createServer({ store, allowAdminRestart = false }) {
       }
       if (segments.length === 4 && segments[3] === 'rotations' && method === 'POST') {
         const input = await readJson(req);
+        const now = new Date().toISOString();
         const { rotation: rot, created } = await store.commit((state) =>
-          rotation.createRotation(state, domainId, input, new Date().toISOString()),
+          rotation.createRotation(state, domainId, input, now),
         );
-        sendJson(res, created ? 201 : 200, rotationView(rot));
+        sendJson(res, created ? 201 : 200, rotationView(rot, now));
         return;
       }
       if (segments.length === 6 && segments[3] === 'rotations' && segments[5] === 'message' && method === 'GET') {
+        const now = nowIso();
+        await store.settle(now);
         const domain = store.state.domains[domainId];
         if (!domain) throw new rotation.DomainError('unknown_domain', `设备域不存在：${domainId}`);
         const rot = domain.rotations[segments[4]];
@@ -197,6 +232,9 @@ function createServer({ store, allowAdminRestart = false }) {
           rotationId: rot.rotationId,
           digest: rot.digest,
           encoding: 'utf-8',
+          status: rot.status,
+          expiresAt: rot.expiresAt,
+          deadline: deadlineView(rot, now),
           message: rotation.authorizationMessage(rot),
         });
         return;

@@ -13,6 +13,20 @@ function esc(value) {
     .replaceAll("'", '&#39;');
 }
 
+/** 剩余时间的人类可读形式（由页面脚本每秒按同一口径重算）。 */
+function formatRemaining(ms) {
+  if (ms <= 0) return '已到截止时刻';
+  const totalSeconds = Math.ceil(ms / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts = [];
+  if (hours > 0) parts.push(`${hours} 小时`);
+  if (minutes > 0) parts.push(`${minutes} 分`);
+  parts.push(`${seconds} 秒`);
+  return `剩余 ${parts.join(' ')}`;
+}
+
 function keyList(keys) {
   return `<ul class="keys">${keys.map((k) => `<li><code>${esc(k)}</code></li>`).join('')}</ul>`;
 }
@@ -38,14 +52,22 @@ function renderCheckpoint(cp) {
   </div>`;
 }
 
-function renderPendingRotation(domain, rot) {
+function renderPendingRotation(domain, rot, now) {
   const message = rotation.authorizationMessage(rot);
+  let deadlineHtml = '<p class="muted">未设置截止时刻：保持补签直至达到父门限</p>';
+  if (rot.expiresAt) {
+    const remainingMs = Date.parse(rot.expiresAt) - Date.parse(now);
+    deadlineHtml = `<p>UTC 截止时刻 <code>${esc(rot.expiresAt)}</code>
+      · <strong class="deadline" data-expires-at="${esc(rot.expiresAt)}">${esc(formatRemaining(remainingMs))}</strong></p>`;
+  }
   return `<div class="checkpoint pending">
     <p>轮换标识 <code>${esc(rot.rotationId)}</code> · 状态 <strong class="pending">待签</strong></p>
     <p>固定父摘要 <code>${esc(rot.parentDigest)}</code> · 下一代次 <strong>${rot.generation}</strong></p>
     <p>候选摘要 <code>${esc(rot.digest)}</code> · 新门限 <strong>${rot.threshold}</strong> / ${rot.keys.length}</p>
+    ${deadlineHtml}
     <details open><summary>排序后新公钥集（${rot.keys.length} 把）</summary>${keyList(rot.keys)}</details>
-    <p>已收集签名 <strong>${rot.signatures.length}</strong> / 父门限 ${domain.threshold}</p>
+    <p>已收集签名 <strong>${rot.signatures.length}</strong> / 父门限 ${domain.threshold}
+       <span class="muted">（须在截止前达到父门限方可激活）</span></p>
     <details><summary>已收签名明细</summary>${evidenceList(rot.signatures)}</details>
     <details><summary>规范待签消息（UTF-8，交由父密钥成员离线签名）</summary><pre class="message">${esc(message)}</pre>
       <button type="button" data-copy="${esc(message)}">复制待签消息</button></details>
@@ -66,10 +88,23 @@ function renderSupersededRotation(rot) {
   </div>`;
 }
 
-function renderDomain(domain) {
+function renderExpiredRotation(rot) {
+  const collected = rot.signatures.length;
+  return `<div class="checkpoint expired">
+    <p>轮换标识 <code>${esc(rot.rotationId)}</code> · 状态 <strong class="expired">已过期</strong></p>
+    <p>固定父摘要 <code>${esc(rot.parentDigest)}</code> · 代次 ${rot.generation} · 候选摘要 <code>${esc(rot.digest)}</code></p>
+    <p>UTC 截止时刻 <code>${esc(rot.expiresAt)}</code> · 固化于 ${esc(rot.expiredAt || '')}
+       · 截止前仅收集 <strong>${collected}</strong> 份去重签名，未达父门限</p>
+    <p>原因：${esc(rot.rejectedReason || '')}</p>
+    <details><summary>已收签名明细（${collected} 份，不作为激活证据）</summary>${evidenceList(rot.signatures)}</details>
+  </div>`;
+}
+
+function renderDomain(domain, now) {
   const rotations = Object.values(domain.rotations).sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
   const pending = rotations.filter((r) => r.status === 'pending');
   const superseded = rotations.filter((r) => r.status === 'superseded');
+  const expired = rotations.filter((r) => r.status === 'expired');
   const checkpoints = Object.values(domain.checkpoints).sort((a, b) => a.generation - b.generation);
 
   return `<article class="domain" id="domain-${esc(domain.id)}">
@@ -82,7 +117,10 @@ function renderDomain(domain) {
     ${checkpoints.map(renderCheckpoint).join('')}
 
     <h4>待签候选（${pending.length}）</h4>
-    ${pending.length ? pending.map((r) => renderPendingRotation(domain, r)).join('') : '<p class="muted">无</p>'}
+    ${pending.length ? pending.map((r) => renderPendingRotation(domain, r, now)).join('') : '<p class="muted">无</p>'}
+
+    <h4>已过期候选（${expired.length}）</h4>
+    ${expired.length ? expired.map(renderExpiredRotation).join('') : '<p class="muted">无</p>'}
 
     <h4>已拒候选（${superseded.length}）</h4>
     ${superseded.length ? superseded.map(renderSupersededRotation).join('') : '<p class="muted">无</p>'}
@@ -95,13 +133,16 @@ function renderDomain(domain) {
         <label>新公钥集（每行一把 64 位十六进制 Ed25519 公钥，2–5 把）
           <textarea name="publicKeys" rows="4" required></textarea></label>
         <label>新门限 <input name="threshold" type="number" min="1" max="5" value="2" required></label>
+        <label>UTC 截止时刻（可选，留空表示不设截止；如 2026-10-07T12:00:00Z）
+          <input name="expiresAt" type="text" placeholder="2026-10-07T12:00:00Z"></label>
         <button type="submit">创建轮换候选</button>
       </form>
     </details>
   </article>`;
 }
 
-function renderPage(state) {
+function renderPage(state, now) {
+  const renderAt = now || new Date().toISOString();
   const domains = Object.values(state.domains).sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
   return `<!doctype html>
 <html lang="zh-CN">
@@ -117,7 +158,9 @@ function renderPage(state) {
   .checkpoint { border-left: 4px solid #16a34a; background: #f0fdf4; padding: .5rem .9rem; margin: .6rem 0; }
   .checkpoint.pending { border-color: #d97706; background: #fffbeb; }
   .checkpoint.superseded { border-color: #dc2626; background: #fef2f2; }
-  .pending { color: #b45309; } .superseded { color: #b91c1c; }
+  .checkpoint.expired { border-color: #7c3aed; background: #f5f3ff; }
+  .pending { color: #b45309; } .superseded { color: #b91c1c; } .expired { color: #6d28d9; }
+  .deadline { color: #b45309; white-space: nowrap; }
   .keys li, .evidence li { margin: .25rem 0; }
   .message { background: #0f172a; color: #e2e8f0; padding: .75rem; border-radius: 6px; white-space: pre-wrap; }
   form label { display: block; margin: .5rem 0; }
@@ -131,7 +174,8 @@ function renderPage(state) {
 <body>
 <h1>隔离维护网 · 设备域命令签发密钥轮换</h1>
 <p class="muted">唯一授权链：新密钥只有在去重后的父密钥成员签名达到父门限时，才会在同一次持久化提交中激活；
-延迟签名、重复重传与竞争候选都不会让新密钥提前生效。</p>
+延迟签名、重复重传与竞争候选都不会让新密钥提前生效。候选可设置可选的 UTC 截止时刻：
+截止前达到父门限才可激活，截止后首次补签或读取会把未激活候选固定为已过期。</p>
 
 <section id="health">健康状态：加载中…</section>
 
@@ -148,9 +192,10 @@ function renderPage(state) {
 
 <section>
   <h2>设备域（${domains.length}） <button type="button" onclick="location.reload()">刷新</button></h2>
-  ${domains.length ? domains.map(renderDomain).join('\n') : '<p class="muted">尚未创建任何设备域。</p>'}
+  ${domains.length ? domains.map((d) => renderDomain(d, renderAt)).join('\n') : '<p class="muted">尚未创建任何设备域。</p>'}
 </section>
 
+<span id="server-time" data-server-time="${esc(renderAt)}" hidden></span>
 <script src="/static/app.js"></script>
 </body>
 </html>`;

@@ -11,6 +11,9 @@
  *      - 页面渲染出相同结果；
  *      - 激活后的竞争候选与迟到补签被拒；
  *      - 并发竞争候选只收敛为一个活动检查点；
+ *      - 可选 UTC 截止时刻：截止前激活；仅一份签名后到点由首次读取
+ *        固化为已过期；迟到重传返回稳定拒因且链头/证据/竞争候选不变；
+ *        无截止候选保持既有补签与激活行为；页面持续显示剩余状态；
  *      - 应用重启后链头、历史检查点与签名证据保持一致；
  *      - 健康端点反映设备域状态。
  *   全部通过退出码 0，否则退出码 1。
@@ -89,6 +92,9 @@ function flipHex(hex) {
   const flipped = last === '0' ? '1' : '0';
   return hex.slice(0, -1) + flipped;
 }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const isoIn = (ms) => new Date(Date.now() + ms).toISOString();
 
 async function waitForHealth(timeoutMs, predicate) {
   const deadline = Date.now() + timeoutMs;
@@ -339,6 +345,239 @@ async function main() {
     domain2Head = after.headDigest;
   });
 
+  // —— 可选 UTC 截止时刻 ——
+  const expireMembers = [genKey(), genKey()];
+
+  async function makeTwoOfTwo(name) {
+    const created = await api('POST', '/api/domains', {
+      name,
+      publicKeys: expireMembers.map((m) => m.publicKey),
+      threshold: 2,
+    });
+    assertEqual(created.status, 201, `创建${name}失败：${created.text}`);
+    return created.json;
+  }
+
+  async function makeCandidate(domId, rid, keys, expiresAt) {
+    const head = (await api('GET', `/api/domains/${domId}/head`)).json.digest;
+    const body = { rotationId: rid, parentDigest: head, publicKeys: keys.map((k) => k.publicKey), threshold: 2 };
+    if (expiresAt !== undefined) body.expiresAt = expiresAt;
+    const res = await api('POST', `/api/domains/${domId}/rotations`, body);
+    return res;
+  }
+
+  async function getRotation(domId, rid) {
+    const detail = await api('GET', `/api/domains/${domId}`);
+    return detail.json.rotations.find((r) => r.rotationId === rid);
+  }
+
+  async function pollRotation(domId, rid, predicate, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    let last = null;
+    while (Date.now() < deadline) {
+      last = await getRotation(domId, rid);
+      if (predicate(last)) return last;
+      await sleep(200);
+    }
+    throw new Error(`等待候选 ${rid} 状态超时，末次：${JSON.stringify(last && last.status)}`);
+  }
+
+  let ddlActivateId;
+  let ddlActivateRot;
+  await step('截止时刻：候选创建读回 expiresAt 与剩余状态；过去时刻被拒', async () => {
+    const dom = await makeTwoOfTwo('截止-激活域');
+    ddlActivateId = dom.id;
+    const keys = [genKey(), genKey()];
+
+    const past = await makeCandidate(ddlActivateId, 'past-deadline', keys, '2000-01-01T00:00:00Z');
+    assertEqual(past.status, 422, `过去的截止时刻应返回 422：${past.text}`);
+    assertEqual(past.json.error.code, 'invalid_expires_at', '拒因应为 invalid_expires_at');
+
+    const expiresAt = isoIn(5000);
+    const res = await makeCandidate(ddlActivateId, 'ddl-activate', keys, expiresAt);
+    assertEqual(res.status, 201, `创建带截止候选失败：${res.text}`);
+    assertEqual(res.json.expiresAt, new Date(expiresAt).toISOString(), 'expiresAt 应被归一化读回');
+    assert(res.json.deadline && res.json.deadline.expiresAt === res.json.expiresAt, '应返回 deadline 剩余状态对象');
+    assert(res.json.deadline.remainingMillis > 4000 && res.json.deadline.remainingMillis <= 5000, '剩余毫秒数应接近给定窗口');
+    assertEqual(res.json.deadline.expired, false, '候选尚未过期');
+    ddlActivateRot = res.json;
+  });
+
+  await step('截止时刻：截止前补齐两名签名，正常激活并推进链头', async () => {
+    const msg = (await api('GET', `/api/domains/${ddlActivateId}/rotations/ddl-activate/message`)).json.message;
+    const batch = expireMembers.map((m) => ({ publicKey: m.publicKey, signature: sign(m, msg) }));
+    const res = await api('POST', `/api/domains/${ddlActivateId}/rotations/ddl-activate/signatures`, { signatures: batch });
+    assertEqual(res.status, 200, `截止前补签失败：${res.text}`);
+    assertEqual(res.json.activated, true, '截止前达到门限应激活');
+    assertEqual(res.json.headDigest, ddlActivateRot.digest, '链头应前进');
+    const rot = await getRotation(ddlActivateId, 'ddl-activate');
+    assertEqual(rot.status, 'activated', '候选状态应为已激活');
+    const head = (await api('GET', `/api/domains/${ddlActivateId}/head`)).json;
+    assertEqual(head.evidence.length, 2, '激活证据应为两份');
+  });
+
+  let ddlExpireId;
+  let ddlExpireHead;
+  let expireSig;
+  const expireRotId = 'ddl-expire';
+  const competitorId = 'ddl-competitor';
+  await step('截止时刻：仅一份签名，截止后首次读取把候选固定为已过期', async () => {
+    const dom = await makeTwoOfTwo('截止-过期域');
+    ddlExpireId = dom.id;
+    ddlExpireHead = dom.headDigest;
+
+    const keys = [genKey(), genKey()];
+    const res = await makeCandidate(ddlExpireId, expireRotId, keys, isoIn(2000));
+    assertEqual(res.status, 201, `创建短截止候选失败：${res.text}`);
+    assert(res.json.expiresAt, '候选应带截止时刻');
+
+    // 同父摘要的竞争候选（无截止），验证固化过期不会改写它
+    const comp = await makeCandidate(ddlExpireId, competitorId, [genKey(), genKey()]);
+    assertEqual(comp.status, 201, `创建竞争候选失败：${comp.text}`);
+
+    const msg = (await api('GET', `/api/domains/${ddlExpireId}/rotations/${expireRotId}/message`)).json.message;
+    expireSig = sign(expireMembers[0], msg);
+    const one = await api('POST', `/api/domains/${ddlExpireId}/rotations/${expireRotId}/signatures`, {
+      signatures: [{ publicKey: expireMembers[0].publicKey, signature: expireSig }],
+    });
+    assertEqual(one.json.activated, false, '仅一份签名不应激活');
+    assertEqual(one.json.signers, 1, '应记录 1 名签名者');
+
+    // 等待截止后，由首次读取（域详情）触发固化
+    const fixed = await pollRotation(ddlExpireId, expireRotId, (r) => r.status === 'expired', 10000);
+    assert(fixed.expiredAt, '应记录固化时刻 expiredAt');
+    assertEqual(fixed.deadline.expired, true, 'deadline 视图应反映已过期');
+    assertEqual(fixed.deadline.remainingMillis, 0, '已过期剩余毫秒应为 0');
+    assert(fixed.rejectedReason && /截止时刻/.test(fixed.rejectedReason), '应记录过期拒因');
+    assertEqual(fixed.signers, 1, '截止前的一份签名保留');
+
+    const head = (await api('GET', `/api/domains/${ddlExpireId}/head`)).json;
+    assertEqual(head.digest, ddlExpireHead, '固化过期不得推进链头');
+    assertEqual(head.evidence.length, 0, '不得新增激活证据');
+
+    const competitor = await getRotation(ddlExpireId, competitorId);
+    assertEqual(competitor.status, 'pending', '竞争候选不应被固化过期改写');
+  });
+
+  await step('截止时刻：过期后的补签与迟到重传返回稳定拒因，并发也只有一个结论', async () => {
+    const msg = (await api('GET', `/api/domains/${ddlExpireId}/rotations/${expireRotId}/message`)).json.message;
+    // 一个新签名 + 第一份签名的重传，并发到达，都应得到同一稳定拒因
+    const [lateNew, lateRetry] = await Promise.all([
+      api('POST', `/api/domains/${ddlExpireId}/rotations/${expireRotId}/signatures`, {
+        signatures: [{ publicKey: expireMembers[1].publicKey, signature: sign(expireMembers[1], msg) }],
+      }),
+      api('POST', `/api/domains/${ddlExpireId}/rotations/${expireRotId}/signatures`, {
+        signatures: [{ publicKey: expireMembers[0].publicKey, signature: expireSig }],
+      }),
+    ]);
+    for (const [label, res] of [['迟到补签', lateNew], ['迟到重传', lateRetry]]) {
+      assertEqual(res.status, 409, `${label}应返回 409：${res.text}`);
+      assertEqual(res.json.error.code, 'rotation_expired', `${label}拒因应稳定为 rotation_expired`);
+    }
+
+    // 再次重传仍是同一拒因（稳定，不随时间变化）
+    const again = await api('POST', `/api/domains/${ddlExpireId}/rotations/${expireRotId}/signatures`, {
+      signatures: [{ publicKey: expireMembers[0].publicKey, signature: expireSig }],
+    });
+    assertEqual(again.json.error.code, 'rotation_expired', '重复到达应保持稳定拒因');
+
+    const rot = await getRotation(ddlExpireId, expireRotId);
+    assertEqual(rot.status, 'expired', '候选保持已过期');
+    assertEqual(rot.signers, 1, '迟到签名不得计入');
+    const head = (await api('GET', `/api/domains/${ddlExpireId}/head`)).json;
+    assertEqual(head.digest, ddlExpireHead, '链头始终不被改写');
+
+    // 固化过期不影响竞争候选：竞争候选仍可正常达标激活
+    const compMsg = (await api('GET', `/api/domains/${ddlExpireId}/rotations/${competitorId}/message`)).json.message;
+    const compRes = await api('POST', `/api/domains/${ddlExpireId}/rotations/${competitorId}/signatures`, {
+      signatures: expireMembers.map((m) => ({ publicKey: m.publicKey, signature: sign(m, compMsg) })),
+    });
+    assertEqual(compRes.json.activated, true, '竞争候选应仍能激活');
+    const expiredRot = await getRotation(ddlExpireId, expireRotId);
+    assertEqual(expiredRot.status, 'expired', '过期候选在竞争候选激活后仍保持过期');
+
+    // 健康端点统计已过期候选
+    const health = (await api('GET', '/healthz')).json;
+    const entry = health.domains.find((d) => d.id === ddlExpireId);
+    assert(entry && entry.counts.expired >= 1, '健康响应应统计已过期候选');
+  });
+
+  let noDeadlineId;
+  let noDeadlineDigest;
+  await step('截止时刻：无截止候选保持既有补签与激活行为（兼容）', async () => {
+    const dom = await makeTwoOfTwo('无截止兼容域');
+    noDeadlineId = dom.id;
+    const keys = [genKey(), genKey()];
+    const res = await makeCandidate(noDeadlineId, 'no-deadline', keys);
+    assertEqual(res.status, 201, `创建无截止候选失败：${res.text}`);
+    assertEqual(res.json.expiresAt, null, '无截止候选 expiresAt 应为 null');
+    assertEqual(res.json.deadline, null, '无截止候选不应有 deadline 视图');
+    noDeadlineDigest = res.json.digest;
+
+    const msg = (await api('GET', `/api/domains/${noDeadlineId}/rotations/no-deadline/message`)).json.message;
+    const first = await api('POST', `/api/domains/${noDeadlineId}/rotations/no-deadline/signatures`, {
+      signatures: [{ publicKey: expireMembers[0].publicKey, signature: sign(expireMembers[0], msg) }],
+    });
+    assertEqual(first.json.activated, false, '一票后保持待签');
+    // 跨越上面短截止窗口之后，无截止候选依旧可以补签激活
+    await sleep(2500);
+    const stillPending = await getRotation(noDeadlineId, 'no-deadline');
+    assertEqual(stillPending.status, 'pending', '时间流逝不应让无截止候选过期');
+    const second = await api('POST', `/api/domains/${noDeadlineId}/rotations/no-deadline/signatures`, {
+      signatures: [{ publicKey: expireMembers[1].publicKey, signature: sign(expireMembers[1], msg) }],
+    });
+    assertEqual(second.json.activated, true, '无截止候选补到门限即激活');
+    assertEqual(second.json.headDigest, noDeadlineDigest, '链头应前进到该候选');
+  });
+
+  let showcaseId;
+  let showcaseDeadlineRid;
+  await step('截止时刻：保留待签候选以持续展示剩余状态（无截止 + 未到期带截止）', async () => {
+    const dom = await makeTwoOfTwo('截止-页面展示域');
+    showcaseId = dom.id;
+    // 无截止、保持待签
+    const none = await makeCandidate(showcaseId, 'show-no-deadline', [genKey(), genKey()]);
+    assertEqual(none.status, 201, `创建无截止展示候选失败：${none.text}`);
+    assertEqual(none.json.expiresAt, null);
+    // 带较长截止、保持待签
+    const future = isoIn(3600 * 1000);
+    const withDeadline = await makeCandidate(showcaseId, 'show-with-deadline', [genKey(), genKey()], future);
+    assertEqual(withDeadline.status, 201, `创建带截止展示候选失败：${withDeadline.text}`);
+    showcaseDeadlineRid = 'show-with-deadline';
+    assert(withDeadline.json.deadline.remainingMillis > 3500 * 1000, '设备域详情应持续给出剩余毫秒数');
+
+    // 稍后再次读取，剩余状态应随时间持续更新
+    await sleep(1100);
+    const again = await getRotation(showcaseId, showcaseDeadlineRid);
+    assertEqual(again.status, 'pending', '未到期候选应保持待签');
+    assert(again.deadline.remainingMillis < withDeadline.json.deadline.remainingMillis,
+      '剩余毫秒数应随读取时刻持续递减');
+    assert(again.deadline.remainingSeconds > 0, '剩余秒数应为正');
+  });
+
+  await step('截止时刻：页面持续显示剩余状态并与接口一致（含已过期分组）', async () => {
+    const page = await api('GET', '/');
+    assertEqual(page.status, 200, '页面应可访问');
+    // 已激活的带截止候选
+    assert(page.text.includes('ddl-activate'), '页面未显示已激活带截止候选');
+    // 已过期候选进入“已过期”分组并显示 UTC 截止时刻
+    assert(page.text.includes(expireRotId), '页面未显示已过期候选标识');
+    assert(page.text.includes('已过期'), '页面缺少已过期候选分组');
+    // 待签候选显示截止剩余；无截止候选显示兼容文案
+    assert(page.text.includes('UTC 截止时刻'), '页面未显示 UTC 截止时刻');
+    assert(page.text.includes('剩余'), '页面未持续显示剩余时间');
+    assert(page.text.includes('未设置截止时刻'), '页面缺少无截止候选的兼容说明');
+    assert(page.text.includes('show-with-deadline') && page.text.includes('show-no-deadline'),
+      '页面未显示两个展示用待签候选');
+    // 倒计时元素携带机器可读的截止时刻，供页面脚本每秒刷新
+    assert(/data-expires-at="\d{4}-\d{2}-\d{2}T[^"]+"/.test(page.text), '页面倒计时元素缺少 data-expires-at');
+    assert(page.text.includes('ddl-expire'), '页面未保留过期候选记录');
+    // 创建表单提供可选截止时刻输入
+    assert(page.text.includes('name="expiresAt"'), '创建候选表单缺少截止时刻输入');
+    // 页面内嵌服务端时刻，供脚本持续刷新剩余状态
+    assert(/id="server-time"\s+data-server-time="[^"]+"/.test(page.text), '页面缺少剩余状态计时基准');
+  });
+
   // —— 重启一致性 ——
   let domain1Before;
   let domain2Before;
@@ -362,6 +601,27 @@ async function main() {
       JSON.stringify(domain2After) === JSON.stringify(domain2Before),
       '并发域重启前后状态不一致（链头/检查点/证据丢失）',
     );
+
+    // 截止时刻三类候选重启后仍可从历史中区分：已激活 / 已过期 /（无截止）已激活
+    const activateAfter = (await api('GET', `/api/domains/${ddlActivateId}`)).json;
+    const expireAfter = (await api('GET', `/api/domains/${ddlExpireId}`)).json;
+    const noDeadlineAfter = (await api('GET', `/api/domains/${noDeadlineId}`)).json;
+    const statusOf = (detail, rid) => detail.rotations.find((r) => r.rotationId === rid).status;
+    assertEqual(statusOf(activateAfter, 'ddl-activate'), 'activated', '重启后应能识别已激活候选');
+    assertEqual(statusOf(expireAfter, expireRotId), 'expired', '重启后应能识别已过期候选');
+    assertEqual(statusOf(expireAfter, competitorId), 'activated', '重启后竞争候选仍为已激活');
+    assertEqual(statusOf(noDeadlineAfter, 'no-deadline'), 'activated', '重启后无截止候选仍为已激活');
+    const expiredRot = expireAfter.rotations.find((r) => r.rotationId === expireRotId);
+    assert(expiredRot.expiresAt && expiredRot.expiredAt && expiredRot.signatures.length === 1,
+      '重启后已过期候选的截止时刻、固化时刻与既有签名应保留');
+    // 重启后立即再次补签，仍是稳定拒因
+    const msg = (await api('GET', `/api/domains/${ddlExpireId}/rotations/${expireRotId}/message`)).json.message;
+    const postReboot = await api('POST', `/api/domains/${ddlExpireId}/rotations/${expireRotId}/signatures`, {
+      signatures: [{ publicKey: expireMembers[1].publicKey, signature: sign(expireMembers[1], msg) }],
+    });
+    assertEqual(postReboot.status, 409, '重启后过期候选补签仍应被拒');
+    assertEqual(postReboot.json.error.code, 'rotation_expired', '重启后拒因应保持稳定');
+
     const head = (await api('GET', `/api/domains/${domainId}/head`)).json;
     assertEqual(head.digest, rotationDigest, '重启后链头摘要变化');
     assertEqual(head.evidence.length, 2, '重启后签名证据份数变化');
